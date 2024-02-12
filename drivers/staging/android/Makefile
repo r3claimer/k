@@ -5,3 +5,5 @@ obj-y					+= ion/
 
 obj-$(CONFIG_ASHMEM)			+= ashmem.o
 obj-$(CONFIG_DEBUG_KINFO)	+= debug_kinfo.o
+obj-y						+= timed_output.o
+obj-y						+= rk_timed_gpio.o

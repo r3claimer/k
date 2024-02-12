@@ -3158,8 +3158,11 @@ dw_hdmi_rk3588_read_hpd(struct dw_hdmi_qp *dw_hdmi, void *data)
 			hdmi->hpd_stat = true;
 			ret = connector_status_connected;
 		} else {
-			hdmi->hpd_stat = false;
-			ret = connector_status_disconnected;
+			// gsy modify : HDMI HPD检测脚和按键B冲突，始终返回HDMI连接状态
+			// hdmi->hpd_stat = false;
+			// ret = connector_status_disconnected;
+			hdmi->hpd_stat = true;
+			ret = connector_status_connected;
 		}
 	} else {
 		if (val & RK3588_HDMI1_LEVEL_INT) {

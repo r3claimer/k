@@ -619,8 +619,8 @@ static int enter_state(suspend_state_t state)
 int pm_suspend(suspend_state_t state)
 {
 	int error;
-
-	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
+	//gsy add : 不进入二级休眠
+	// if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
 		return -EINVAL;
 
 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);

@@ -29,6 +29,10 @@
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/trigger_consumer.h>
 
+#include <linux/input.h>
+#include <linux/atomic.h>
+
+
 #define ADS1015_DRV_NAME "ads1015"
 
 #define ADS1015_CHANNELS 8
@@ -72,15 +76,30 @@
 #define ADS1015_SINGLESHOT	1
 
 #define ADS1015_SLEEP_DELAY_MS		2000
-#define ADS1015_DEFAULT_PGA		2
+#define ADS1015_DEFAULT_PGA		1
 #define ADS1015_DEFAULT_DATA_RATE	4
 #define ADS1015_DEFAULT_CHAN		0
+#define MIN_VAL 600
+static int dbg_enable = 0;
+
+#define DBG(args...) \
+	do { \
+		if (dbg_enable) { \
+			pr_info(args); \
+		} \
+	} while (0)
 
 enum chip_ids {
 	ADSXXXX = 0,
 	ADS1015,
 	ADS1115,
 };
+
+atomic_t ads1015_shared_bradata = ATOMIC_INIT(0);
+EXPORT_SYMBOL(ads1015_shared_bradata);
+
+atomic_t ads1015_shared_gasdata = ATOMIC_INIT(0);
+EXPORT_SYMBOL(ads1015_shared_gasdata);
 
 enum ads1015_channels {
 	ADS1015_AIN0_AIN1 = 0,
@@ -251,7 +270,14 @@ struct ads1015_data {
 	 * mode and exits from a power-down state.  This flag is used to avoid
 	 * getting the stale result from the conversion register.
 	 */
+	 
 	bool conv_invalid;
+
+	struct iio_dev *indio_dev;	
+	struct input_dev *input;
+	
+	unsigned int last_data[4];
+	int raw_data[2];
 };
 
 static bool ads1015_event_channel_enabled(struct ads1015_data *data)
@@ -263,6 +289,7 @@ static void ads1015_event_channel_enable(struct ads1015_data *data, int chan,
 					 int comp_mode)
 {
 	WARN_ON(ads1015_event_channel_enabled(data));
+	DBG("lqb func = %s\n",__func__);
 
 	data->event_channel = chan;
 	data->comp_mode = comp_mode;
@@ -270,11 +297,14 @@ static void ads1015_event_channel_enable(struct ads1015_data *data, int chan,
 
 static void ads1015_event_channel_disable(struct ads1015_data *data, int chan)
 {
+	DBG("lqb func = %s\n",__func__);
+
 	data->event_channel = ADS1015_CHANNELS;
 }
 
 static bool ads1015_is_writeable_reg(struct device *dev, unsigned int reg)
 {
+
 	switch (reg) {
 	case ADS1015_CFG_REG:
 	case ADS1015_LO_THRESH_REG:
@@ -321,6 +351,7 @@ static int ads1015_set_power_state(struct ads1015_data *data, bool on)
 {
 	int ret;
 	struct device *dev = regmap_get_device(data->regmap);
+	DBG("lqb func = %s\n",__func__);
 
 	if (on) {
 		ret = pm_runtime_get_sync(dev);
@@ -348,11 +379,13 @@ int ads1015_get_adc_result(struct ads1015_data *data, int chan, int *val)
 {
 	int ret, pga, dr, dr_old, conv_time;
 	unsigned int old, mask, cfg;
+//	DBG("lqb func = %s\n",__func__);
 
 	if (chan < 0 || chan >= ADS1015_CHANNELS)
 		return -EINVAL;
 
 	ret = regmap_read(data->regmap, ADS1015_CFG_REG, &old);
+	
 	if (ret)
 		return ret;
 
@@ -401,13 +434,14 @@ static irqreturn_t ads1015_trigger_handler(int irq, void *p)
 		s64 timestamp __aligned(8);
 	} scan;
 	int chan, ret, res;
-
+	DBG("lqb func = %s\n",__func__);
 	memset(&scan, 0, sizeof(scan));
 
 	mutex_lock(&data->lock);
 	chan = find_first_bit(indio_dev->active_scan_mask,
 			      indio_dev->masklength);
 	ret = ads1015_get_adc_result(data, chan, &res);
+	DBG("lqb func = %s new result = %d\n",__func__,res);
 	if (ret < 0) {
 		mutex_unlock(&data->lock);
 		goto err;
@@ -432,6 +466,7 @@ static int ads1015_set_scale(struct ads1015_data *data,
 	int i;
 	int fullscale = div_s64((scale * 1000000LL + uscale) <<
 				(chan->scan_type.realbits - 1), 1000000);
+	DBG("lqb func = %s\n",__func__);
 
 	for (i = 0; i < ARRAY_SIZE(ads1015_fullscale_range); i++) {
 		if (ads1015_fullscale_range[i] == fullscale) {
@@ -446,6 +481,7 @@ static int ads1015_set_scale(struct ads1015_data *data,
 static int ads1015_set_data_rate(struct ads1015_data *data, int chan, int rate)
 {
 	int i;
+	DBG("lqb func = %s\n",__func__);
 
 	for (i = 0; i < ARRAY_SIZE(ads1015_data_rate); i++) {
 		if (data->data_rate[i] == rate) {
@@ -463,6 +499,7 @@ static int ads1015_read_raw(struct iio_dev *indio_dev,
 {
 	int ret, idx;
 	struct ads1015_data *data = iio_priv(indio_dev);
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 	switch (mask) {
@@ -484,6 +521,8 @@ static int ads1015_read_raw(struct iio_dev *indio_dev,
 			goto release_direct;
 
 		ret = ads1015_get_adc_result(data, chan->address, val);
+		
+		DBG("lqb func = %s new result = %d\n",__func__,val);
 		if (ret < 0) {
 			ads1015_set_power_state(data, false);
 			goto release_direct;
@@ -526,6 +565,7 @@ static int ads1015_write_raw(struct iio_dev *indio_dev,
 {
 	struct ads1015_data *data = iio_priv(indio_dev);
 	int ret;
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 	switch (mask) {
@@ -554,6 +594,7 @@ static int ads1015_read_event(struct iio_dev *indio_dev,
 	unsigned int comp_queue;
 	int period;
 	int dr;
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 
@@ -595,6 +636,7 @@ static int ads1015_write_event(struct iio_dev *indio_dev,
 	long long period;
 	int i;
 	int dr;
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 
@@ -636,6 +678,7 @@ static int ads1015_read_event_config(struct iio_dev *indio_dev,
 {
 	struct ads1015_data *data = iio_priv(indio_dev);
 	int ret = 0;
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 	if (data->event_channel == chan->address) {
@@ -663,6 +706,7 @@ static int ads1015_enable_event_config(struct ads1015_data *data,
 	int high_thresh = data->thresh_data[chan->address].high_thresh;
 	int ret;
 	unsigned int val;
+	DBG("lqb func = %s\n",__func__);
 
 	if (ads1015_event_channel_enabled(data)) {
 		if (data->event_channel != chan->address ||
@@ -694,6 +738,7 @@ static int ads1015_enable_event_config(struct ads1015_data *data,
 	ads1015_event_channel_enable(data, chan->address, comp_mode);
 
 	ret = ads1015_get_adc_result(data, chan->address, &val);
+	
 	if (ret) {
 		ads1015_event_channel_disable(data, chan->address);
 		ads1015_set_power_state(data, false);
@@ -706,6 +751,7 @@ static int ads1015_disable_event_config(struct ads1015_data *data,
 	const struct iio_chan_spec *chan, int comp_mode)
 {
 	int ret;
+	DBG("lqb func = %s\n",__func__);
 
 	if (!ads1015_event_channel_enabled(data))
 		return 0;
@@ -737,6 +783,7 @@ static int ads1015_write_event_config(struct iio_dev *indio_dev,
 	int ret;
 	int comp_mode = (dir == IIO_EV_DIR_EITHER) ?
 		ADS1015_CFG_COMP_MODE_WINDOW : ADS1015_CFG_COMP_MODE_TRAD;
+	DBG("lqb func = %s\n",__func__);
 
 	mutex_lock(&data->lock);
 
@@ -764,12 +811,12 @@ static irqreturn_t ads1015_event_handler(int irq, void *priv)
 	struct ads1015_data *data = iio_priv(indio_dev);
 	int val;
 	int ret;
-
+DBG("ads1015_event_handler\n");
 	/* Clear the latched ALERT/RDY pin */
 	ret = regmap_read(data->regmap, ADS1015_CONV_REG, &val);
 	if (ret)
 		return IRQ_HANDLED;
-
+DBG("lqb ads1015_event_handler value = %d\n",val);
 	if (ads1015_event_channel_enabled(data)) {
 		enum iio_event_direction dir;
 		u64 code;
@@ -787,6 +834,7 @@ static irqreturn_t ads1015_event_handler(int irq, void *priv)
 static int ads1015_buffer_preenable(struct iio_dev *indio_dev)
 {
 	struct ads1015_data *data = iio_priv(indio_dev);
+	DBG("lqb func = %s\n",__func__);
 
 	/* Prevent from enabling both buffer and event at a time */
 	if (ads1015_event_channel_enabled(data))
@@ -797,6 +845,8 @@ static int ads1015_buffer_preenable(struct iio_dev *indio_dev)
 
 static int ads1015_buffer_postdisable(struct iio_dev *indio_dev)
 {
+	DBG("lqb func = %s\n",__func__);
+
 	return ads1015_set_power_state(iio_priv(indio_dev), false);
 }
 
@@ -928,10 +978,179 @@ static void ads1015_get_channels_config(struct i2c_client *client)
 
 static int ads1015_set_conv_mode(struct ads1015_data *data, int mode)
 {
+	DBG("lqb func = %s\n",__func__);
+
 	return regmap_update_bits(data->regmap, ADS1015_CFG_REG,
 				  ADS1015_CFG_MOD_MASK,
 				  mode << ADS1015_CFG_MOD_SHIFT);
 }
+
+static int adc_to_abs(int val,int data)
+{
+	int abs_val;
+	if(val < MIN_VAL) val = MIN_VAL;
+	abs_val = 255 - (val-MIN_VAL)*255/(data-MIN_VAL);
+	if(abs_val > 250) abs_val=255;
+	else if(abs_val < 5) abs_val = 0;
+	return abs_val;
+}
+static void adc_banji_poll(struct input_dev *input)
+{
+	int val[4],ret,i;
+	struct ads1015_data *data = input_get_drvdata(input);
+		int shift = ads1015_channels[7].scan_type.shift;
+		struct iio_dev *indio_dev;		
+		indio_dev = data->indio_dev;
+		ret = iio_device_claim_direct_mode(indio_dev);
+		if (ret)
+		{
+			DBG("lqb iio_device_claim_direct_mode error!\n");
+			return;
+		}
+
+
+		for(i = 0;i <= 3 ;i++){
+			ret = ads1015_get_adc_result(data, ads1015_channels[i+4].address, &val[i]);
+			val[i] = sign_extend32(val[i] >> shift, 15 - shift);			
+		}
+		
+		if(val[0]<300){
+			input_event(input, EV_KEY, KEY_PLAYPAUSE, 1);			
+			DBG("lqb func = %s new result[%d] = %d\n",__func__,i,val[0]);
+		}else {
+			input_event(input, EV_KEY, KEY_PLAYPAUSE, 0);
+		}
+
+		//判断左扳机（ABS_BRAKE）是否有按下	
+		if(val[2]>data->raw_data[0]-35&&val[2]<data->raw_data[0]+35)
+		{
+			data->last_data[2] = val[2];
+			atomic_set(&ads1015_shared_bradata,0);
+			DBG("ABS_BRAKE atomic_set data 0");
+		}else if(val[2]<data->raw_data[0]-10)
+		{			
+			//按下的值是一样的则不重复上报
+			if(val[2] !=data->last_data[2])
+			{		
+				data->last_data[2] = val[2];
+				val[2] = adc_to_abs(val[2],data->raw_data[0]);			
+				atomic_set(&ads1015_shared_bradata,val[2]);				
+				DBG("ABS_BRAKE atomic_set data %d\n",val[2]);
+			}
+		}
+
+		//判断右扳机（ABS_GAS）是否有按下	
+		if(val[3]>data->raw_data[1]-10&&val[3]<data->raw_data[1]+10){
+			atomic_set(&ads1015_shared_gasdata,0);
+			DBG("ABS_GAS atomic_set data 0");
+			data->last_data[3] = val[3];
+		}else if(val[3]<data->raw_data[1]-10)
+		{			
+			if(val[3] !=data->last_data[3])
+			{			
+				data->last_data[3] = val[3];
+				val[3] = adc_to_abs(val[3],data->raw_data[1]);
+				atomic_set(&ads1015_shared_gasdata,val[3]);
+				DBG("ABS_BRAKE atomic_set data %d\n",val[3]);
+			}
+		}				
+	
+		input_sync(data->input);
+		iio_device_release_direct_mode(indio_dev);
+return;
+}
+
+static int average_data(struct ads1015_data *data, int chan){
+	int i ,ret;
+	int val = 0;
+	int sum = 0;	
+	int shift = ads1015_channels[7].scan_type.shift;
+	
+	for(i = 0;i < 10 ;i++){
+		ret = ads1015_get_adc_result(data, chan, &val);
+		val = sign_extend32(val >> shift, 15 - shift);
+		sum +=val;
+	}
+	sum = sum/10;
+	DBG("average_data chan = %d,sum = %d\n",chan,sum);
+	return sum;
+	
+}
+
+static ssize_t ads1015_calibration_show(struct device *pdev,
+			struct device_attribute *attr, char *buf){
+	struct iio_dev *indio_dev;
+	struct ads1015_data *data;
+	struct i2c_client* client = container_of(pdev,struct i2c_client,dev);
+
+	indio_dev = i2c_get_clientdata(client);	
+	data = iio_priv(indio_dev);
+
+	return sprintf(buf, "%d,%d\n", data->raw_data[0],data->raw_data[1]);
+}
+
+static ssize_t ads1015_calibration_store(struct device *pdev,
+			struct device_attribute *attr, const char *buf, size_t count){
+
+	struct iio_dev *indio_dev;
+	struct ads1015_data *data;
+	int ret,i;
+	char *token;
+	int err;
+	int cou = 0;
+	char str[15];
+	int val[2];
+	char *cur = str;
+	struct i2c_client* client = container_of(pdev,struct i2c_client,dev);
+	memset(val,0,sizeof(val));
+	DBG("joystick_calibration_store lqb buf:%s count:%d\n",buf,count);
+	strcpy(str,buf);
+
+	indio_dev = i2c_get_clientdata(client);	
+	data = iio_priv(indio_dev);
+	DBG("ads1015_calibration_store name = %s\n",client->name);
+	//开机第一次进行校正	
+	if(count < 3)
+	{
+		ret = iio_device_claim_direct_mode(indio_dev);
+		for(i=0;i<2;i++){
+			data->raw_data[i] = average_data(data,ads1015_channels[i+6].address);
+		}
+		DBG("data->raw_data[0] = %d,data->raw_data[1] = %d\n",data->raw_data[0],data->raw_data[1]);		
+		iio_device_release_direct_mode(indio_dev);
+	}else{
+		token = strsep(&cur,",");//字符串分离
+		while( token && cou < 2){
+			err = kstrtoint(token,10,&val[cou]);//保存分离后的字符串
+			DBG("joystick_calibration_store %d Conversion result is %d\n",cou,val[cou]);
+		    if (err) {
+        		pr_err("joystick_calibration_store Failed to parse string: %s\n", str);
+		        return err;
+   			}
+			data->raw_data[cou] = val[cou];
+			token = strsep(&cur,",");
+			cou++;
+		}
+	}
+
+	return count;
+}	
+
+
+static DEVICE_ATTR_RW(ads1015_calibration);
+
+
+static struct attribute *ads1015_calibration_attrs[] = {
+        &dev_attr_ads1015_calibration.attr,
+        NULL
+ };
+
+
+static const struct attribute_group  ads1015_calibration_group_attrs = {
+	.attrs = ads1015_calibration_attrs,
+};
+
+
 
 static int ads1015_probe(struct i2c_client *client,
 			 const struct i2c_device_id *id)
@@ -940,25 +1159,28 @@ static int ads1015_probe(struct i2c_client *client,
 	struct ads1015_data *data;
 	int ret;
 	enum chip_ids chip;
-	int i;
-
+	int i,value;
+	struct input_dev *input;
 	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
 	if (!indio_dev)
 		return -ENOMEM;
-
+	
 	data = iio_priv(indio_dev);
 	i2c_set_clientdata(client, indio_dev);
-
+	data->indio_dev = indio_dev;
 	mutex_init(&data->lock);
 
 	indio_dev->name = ADS1015_DRV_NAME;
 	indio_dev->modes = INDIO_DIRECT_MODE;
+
+	ret = sysfs_create_group(&client->dev.kobj,&ads1015_calibration_group_attrs);
 
 	chip = (enum chip_ids)device_get_match_data(&client->dev);
 	if (chip == ADSXXXX)
 		chip = id->driver_data;
 	switch (chip) {
 	case ADS1015:
+		DBG("lqb %s  ADS1015!!!!!!\n",__func__);
 		indio_dev->channels = ads1015_channels;
 		indio_dev->num_channels = ARRAY_SIZE(ads1015_channels);
 		indio_dev->info = &ads1015_info;
@@ -990,11 +1212,59 @@ static int ads1015_probe(struct i2c_client *client,
 	/* we need to keep this ABI the same as used by hwmon ADS1015 driver */
 	ads1015_get_channels_config(client);
 
+	memset(data->last_data, 0, sizeof(data->last_data));
+	memset(data->raw_data, 0, sizeof(data->raw_data));
+	
 	data->regmap = devm_regmap_init_i2c(client, &ads1015_regmap_config);
 	if (IS_ERR(data->regmap)) {
 		dev_err(&client->dev, "Failed to allocate register map\n");
 		return PTR_ERR(data->regmap);
 	}
+
+
+	input = devm_input_allocate_device(&client->dev);
+		if (!input) {
+			dev_err(&client->dev, "Unable to allocate input device\n");
+			return -ENOMEM;
+		}
+		ret = input_setup_polling(input, adc_banji_poll);
+		if (ret) {
+			dev_err(&client->dev, "Unable to set up polling: %d\n", ret);
+			return ret;
+		}
+			if (!device_property_read_u32(&client->dev, "poll-interval", &value))
+		{
+			input_set_poll_interval(input, value);
+		}
+		data->input = input;
+		
+		input->name = client->name;
+//		input->phys = "adc-banji/input0";
+	
+//		input->id.bustype = BUS_HOST;
+//		input->id.vendor = 0x0810;
+//		input->id.product = 0x0002;
+//		input->id.version = 0x0100;
+
+//		input->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+//		__set_bit(EV_ABS, input->evbit);
+		__set_bit(EV_KEY, input->evbit);
+
+
+		__set_bit(KEY_PLAYPAUSE,input->keybit);
+	
+		/* Enable auto repeat feature of Linux input subsystem */
+		if (device_property_read_bool(&client->dev, "autorepeat"))
+			__set_bit(EV_REP, input->evbit);
+			
+		input_set_drvdata(input, data);
+		ret = input_register_device(input);
+		if (ret) {
+			dev_err(&client->dev, "Unable to register input device\n");
+			return ret;
+		}
+
+		
 
 	ret = devm_iio_triggered_buffer_setup(&client->dev, indio_dev, NULL,
 					      ads1015_trigger_handler,
@@ -1003,12 +1273,14 @@ static int ads1015_probe(struct i2c_client *client,
 		dev_err(&client->dev, "iio triggered buffer setup failed\n");
 		return ret;
 	}
-
 	if (client->irq) {
 		unsigned long irq_trig =
 			irqd_get_trigger_type(irq_get_irq_data(client->irq));
 		unsigned int cfg_comp_mask = ADS1015_CFG_COMP_QUE_MASK |
 			ADS1015_CFG_COMP_LAT_MASK | ADS1015_CFG_COMP_POL_MASK;
+//		unsigned int cfg_comp =
+//			0 << ADS1015_CFG_COMP_QUE_SHIFT |
+//			1 << ADS1015_CFG_COMP_LAT_SHIFT;
 		unsigned int cfg_comp =
 			ADS1015_CFG_COMP_DISABLE << ADS1015_CFG_COMP_QUE_SHIFT |
 			1 << ADS1015_CFG_COMP_LAT_SHIFT;
@@ -1029,35 +1301,46 @@ static int ads1015_probe(struct i2c_client *client,
 		ret = regmap_update_bits(data->regmap, ADS1015_CFG_REG,
 					cfg_comp_mask, cfg_comp);
 		if (ret)
+		{
+			DBG("lqb regmap_update_bits error!!!!!!\n");
 			return ret;
-
+		}
 		ret = devm_request_threaded_irq(&client->dev, client->irq,
 						NULL, ads1015_event_handler,
 						irq_trig | IRQF_ONESHOT,
 						client->name, indio_dev);
 		if (ret)
+		{
+				DBG("lqb devm_request_threaded_irq error!!!!!!\n");
 			return ret;
+		}
 	}
 
 	ret = ads1015_set_conv_mode(data, ADS1015_CONTINUOUS);
 	if (ret)
+	{
+	DBG("lqb ads1015_set_conv_mode error!!!!!!\n");
 		return ret;
-
+		}
 	data->conv_invalid = true;
 
 	ret = pm_runtime_set_active(&client->dev);
 	if (ret)
-		return ret;
+	{
+		DBG("lqb pm_runtime_set_active error!!!!!!\n");
+	return ret;
+
+	}
 	pm_runtime_set_autosuspend_delay(&client->dev, ADS1015_SLEEP_DELAY_MS);
 	pm_runtime_use_autosuspend(&client->dev);
 	pm_runtime_enable(&client->dev);
-
+	DBG("lqblqblqblqb!!!!!!\n");
 	ret = iio_device_register(indio_dev);
 	if (ret < 0) {
 		dev_err(&client->dev, "Failed to register IIO device\n");
 		return ret;
 	}
-
+	DBG("lqb available_scan_masks = %d\n",indio_dev->available_scan_masks);
 	return 0;
 }
 
@@ -1140,3 +1423,4 @@ module_i2c_driver(ads1015_driver);
 MODULE_AUTHOR("Daniel Baluta <daniel.baluta@intel.com>");
 MODULE_DESCRIPTION("Texas Instruments ADS1015 ADC driver");
 MODULE_LICENSE("GPL v2");
+

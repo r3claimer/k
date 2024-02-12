@@ -50,7 +50,8 @@ static void adc_keys_poll(struct input_dev *input)
 		}
 	}
 
-	if (abs(st->keyup_voltage - value) < closest)
+	//if (abs(st->keyup_voltage - value) < closest)
+	if (abs(st->keyup_voltage - value) < closest || closest > 30)
 		keycode = 0;
 
 	if (st->last_key && st->last_key != keycode)

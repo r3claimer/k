@@ -293,9 +293,14 @@ static int mc_spk_event(struct snd_soc_dapm_widget *w,
 	struct snd_soc_card *card = w->dapm->card;
 	struct multicodecs_data *mc_data = snd_soc_card_get_drvdata(card);
 
+	// gsy add : 修复3.5毫米耳机插入，喇叭功放引脚没有被拉低
+	struct snd_soc_jack *jack_headset = mc_data->jack_headset;
+
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
-		gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 1);
+		// gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 1);
+		if (!(jack_headset->status & SND_JACK_HEADPHONE))
+           gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 1);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
 		gpiod_set_value_cansleep(mc_data->spk_ctl_gpio, 0);

@@ -29,6 +29,29 @@
 #include <linux/spinlock.h>
 #include <dt-bindings/input/gpio-keys.h>
 
+#include <linux/err.h>
+#include <linux/iio/consumer.h>
+#include <linux/iio/types.h>
+#include <linux/input-polldev.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/property.h>
+#include <linux/of_gpio.h>
+#include <linux/device/driver.h>
+#include <linux/sysfs.h>
+#include <linux/string.h>
+#include <linux/atomic.h>
+
+static int dbg_enable = 0;
+
+#define DBG(args...) \
+	do { \
+		if (dbg_enable) { \
+			pr_info(args); \
+		} \
+	} while(0)
+
+
 struct gpio_button_data {
 	const struct gpio_keys_button *button;
 	struct input_dev *input;
@@ -48,6 +71,7 @@ struct gpio_button_data {
 	bool disabled;
 	bool key_pressed;
 	bool suspended;
+
 };
 
 struct gpio_keys_drvdata {
@@ -55,8 +79,252 @@ struct gpio_keys_drvdata {
 	struct input_dev *input;
 	struct mutex disable_lock;
 	unsigned short *keymap;
+	
+	struct iio_channel *channelx;
+	struct iio_channel *channely;
+	struct iio_channel *channelz;
+	struct iio_channel *channelrz;
+	int num_joystick;
+	
+	unsigned char now_data[4];
+	int raw_data[4];
+	
+	int last_bra;
+	int last_gas;
+	
 	struct gpio_button_data data[];
 };
+
+static unsigned char abs_date[]={128,128,128,128};
+
+extern atomic_t ads1015_shared_bradata;
+extern atomic_t ads1015_shared_gasdata;
+
+static int average_data(struct iio_channel *chan){
+	int i,value;
+	int sum = 0;
+	int ret = 0;
+	DBG("**********************\n");
+	for(i = 0;i<10;i++){
+		ret = iio_read_channel_processed(chan, &value);
+//		DBG("average_data value = %d\n",value);
+		sum+=value;
+	}
+	sum = sum/10;
+	DBG("average_data**********************sum = %d\n",sum);
+	return sum;
+}
+
+static int get_raw_data(struct gpio_keys_drvdata *st){
+
+	st->raw_data[0] = average_data(st->channelx);
+	DBG("lqblqb get_raw_data x = %d\n",st->raw_data[0]);
+
+	st->raw_data[1] = average_data(st->channely);
+	DBG("lqblqb get_raw_data y = %d\n",st->raw_data[1]);
+	
+	st->raw_data[2] = average_data(st->channelrz);
+	DBG("lqblqb get_raw_data rz = %d\n",st->raw_data[2]);
+
+	st->raw_data[3] = average_data(st->channelz);
+	DBG("lqblqb get_raw_data z = %d\n",st->raw_data[3]);
+	return 0;
+}
+
+
+static int cal_data(int val,int data){
+	int ret = 0;
+	if(val > (data +100))
+	{
+		ret = 128 + (val-data) * 127/(1700 -data);		
+	}
+	else if(val < (data - 100 ))
+	{
+		ret = val * 127/(data-100);	
+	}
+	else {
+		ret = 128;
+	}
+	
+	return	ret;
+
+}
+
+
+static int adc_to_abs(int val,int data) {
+	int abs_val;
+	if(val > 1700) val = 1700;
+		else if(val < 100) val = 0;
+	abs_val = cal_data(val,data);
+	return abs_val;
+};
+
+static void adc_joystick_poll(struct input_dev *dev){
+
+	struct gpio_keys_drvdata *st = input_get_drvdata(dev);
+	int value, ret;
+	int state = 0;
+	int data_bra =0;
+	int data_gas = 0;
+	DBG("lqbjoy *******************************\n");
+
+	// joystick x
+	ret = iio_read_channel_processed(st->channelx, &value);
+	if (unlikely(ret < 0)) {
+		/* Forcibly release key if any was pressed */
+		value = 1024;
+	}
+	
+	st->now_data[0] = adc_to_abs(value,st->raw_data[0]);
+	DBG("lqbjoy read adc_to_abs[x_val] %d,value = %d\n",adc_to_abs(value,st->raw_data[0]),value);
+//	if(st->data[0] == 127) st->data[0] = 128;
+	
+	// joystick y
+	ret = iio_read_channel_processed(st->channely, &value);
+	if (unlikely(ret < 0)) {
+		value = 1024;
+	}
+	
+	st->now_data[1] = 255 - adc_to_abs(value,st->raw_data[1]);
+	 DBG("lqbjoy read adc_to_abs[y_val] %d----value = %d\n",adc_to_abs(value,st->raw_data[1]),value);
+
+	// joystick rz
+	ret = iio_read_channel_processed(st->channelrz, &value);
+	if (unlikely(ret < 0)) {
+		/* Forcibly release key if any was pressed */
+		value = 1024;
+	}
+
+	st->now_data[2] = adc_to_abs(value,st->raw_data[2]);
+	
+	DBG("lqbjoy read adc_to_abs[rz_val] %d----value = %d\n",adc_to_abs(value,st->raw_data[2]),value);
+//	if(st->data[2] == 127) st->data[2] = 128;
+	
+	// joystick z
+	ret = iio_read_channel_processed(st->channelz, &value);
+	if (unlikely(ret < 0)) {
+		/* Forcibly release key if any was pressed */
+		value = 1024;
+	}
+	
+	st->now_data[3] = adc_to_abs(value,st->raw_data[3]);
+	
+	DBG("lqbjoy read adc_to_abs[z_val] %d----value = %d\n",adc_to_abs(value,st->raw_data[3]),value);
+	
+	data_bra = atomic_read(&ads1015_shared_bradata);
+	DBG("ABS_BRAKE value = %d\n",data_bra);
+	data_gas = atomic_read(&ads1015_shared_gasdata);
+	DBG("ABS_GAS value = %d\n",data_gas);
+
+	if(data_bra) input_event(st->input, EV_KEY, BTN_TL2, 1);
+	else input_event(st->input, EV_KEY, BTN_TL2, 0);
+	
+	if(data_gas) input_event(st->input, EV_KEY, BTN_TR2, 1);
+	else input_event(st->input, EV_KEY, BTN_TR2, 0);
+	
+	if(abs_date[0] != st->now_data[0]) state++;
+	if(abs_date[1] != st->now_data[1]) state++;
+	if(abs_date[2] != st->now_data[2]) state++;
+	if(abs_date[3] != st->now_data[3]) state++;
+	if(data_gas != st->last_gas) state++;
+	if(data_bra != st->last_bra) state++;
+	if(state > 0){
+		abs_date[0] = st->now_data[0];
+		abs_date[1] = st->now_data[1];
+		abs_date[2] = st->now_data[2];
+		abs_date[3] = st->now_data[3];
+		st->last_gas = data_gas;
+		st->last_bra = data_bra;
+		DBG("lqb datax = %d,datay= %d,datarz = %d,dataz= %d\n",abs_date[0],abs_date[1],abs_date[2],abs_date[3]);
+		input_report_abs(st->input, ABS_X,  abs_date[0]);
+		input_report_abs(st->input, ABS_Y,  abs_date[1]);
+
+		input_report_abs(st->input, ABS_RZ, abs_date[2]);
+		input_report_abs(st->input, ABS_Z,  abs_date[3]);
+
+		input_report_abs(st->input, ABS_THROTTLE,data_gas);	
+		input_report_abs(st->input, ABS_BRAKE,data_bra);
+
+		DBG("lqb input_report_abs ABS_GAS= %d,ABS_BRAKE= %d\n",data_gas,data_bra);
+		input_sync(st->input);
+		state = 0;
+	}
+	
+	DBG("lqbjoy*******************************\n");
+}
+
+
+static ssize_t joystick_calibration_show(struct device *pdev,
+			struct device_attribute *attr, char *buf){
+	struct gpio_keys_drvdata *st;
+	struct platform_device *dev;
+		DBG("lqb joystick_calibration_show	\n");
+		
+		dev = to_platform_device(pdev);
+		st = dev_get_drvdata(&dev->dev);		
+		DBG("st->raw_data[0] = %d,st->raw_data[0] = %d,st->raw_data[0] = %d,st->raw_data[0] = %d\n",st->raw_data[0],st->raw_data[1],st->raw_data[2],st->raw_data[3]);
+	return sprintf(buf, "%d,%d,%d,%d\n", st->raw_data[0],st->raw_data[1],st->raw_data[2],st->raw_data[3]);
+//return sprintf(buf, "%d\n", st->raw_data[0]);
+//return 1;
+}
+
+static ssize_t joystick_calibration_store(struct device *pdev,
+			struct device_attribute *attr, const char *buf, size_t count){
+	struct platform_device *dev;
+	struct gpio_keys_drvdata *st;
+	char *token;
+	int err;
+	int cou = 0;
+	char str[30];
+	int val[4];
+	char *cur = str;
+	
+	memset(val,0,sizeof(val));
+	DBG("joystick_calibration_store lqb buf:%s count:%d\n",buf,count);
+	strcpy(str,buf);
+	
+	dev = to_platform_device(pdev);
+	DBG("joystick_calibration_store str =  %s\n",str);
+	st = dev_get_drvdata(&dev->dev);
+	if(buf == NULL) return -1;
+	if(count < 3)
+	{
+		DBG("joystick_calibration_store buf == 1,get_raw_data");
+		get_raw_data(st);	
+	}
+	else{
+		token = strsep(&cur,",");
+		while( token && cou < 4){
+			err = kstrtoint(token,10,&val[cou]);
+			DBG("joystick_calibration_store %d Conversion result is %d\n",cou,val[cou]);
+		    if (err) {
+        		pr_err("joystick_calibration_store Failed to parse string: %s\n", str);
+		        return err;
+   			}
+			st->raw_data[cou] = val[cou];
+			token = strsep(&cur,",");
+			cou++;
+		}
+	}
+
+	return count;
+}	
+
+
+static DEVICE_ATTR_RW(joystick_calibration);
+
+
+static struct attribute *joystick_calibration_attrs[] = {
+        &dev_attr_joystick_calibration.attr,
+        NULL
+ };
+
+
+static const struct attribute_group  joystick_calibration_group_attrs = {
+	.attrs = joystick_calibration_attrs,
+};
+//ATTRIBUTE_GROUPS(peng);
+
 
 /*
  * SYSFS interface for enabling/disabling keys and switches:
@@ -353,14 +621,28 @@ static struct attribute *gpio_keys_attrs[] = {
 };
 ATTRIBUTE_GROUPS(gpio_keys);
 
+static void other_key_report(struct input_dev *input,unsigned int code ,int state,int value){
+	if(state)
+	{
+		printk("11111111111other_key_report code = %d,state = %d,value = %d\n",code,state,value);
+		input_report_abs(input, code,value);
+	}
+	else{
+		input_report_abs(input, code,127);		
+		printk("00000000000other_key_report code = %d,state = %d,value = %d\n",code,state,value);
+	}
+}
+
 static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 {
 	const struct gpio_keys_button *button = bdata->button;
 	struct input_dev *input = bdata->input;
 	unsigned int type = button->type ?: EV_KEY;
 	int state;
-
+	unsigned short code = 0;
 	state = gpiod_get_value_cansleep(bdata->gpiod);
+	
+	printk("func = %s lqbirq state = %d,code = %d\n",__func__,state,*bdata->code);
 	if (state < 0) {
 		dev_err(input->dev.parent,
 			"failed to get gpio state: %d\n", state);
@@ -369,9 +651,23 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 
 	if (type == EV_ABS) {
 		if (state)
-			input_event(input, type, button->code, button->value);
+			input_event(input, type, button->code, button->value);	
+		printk("lqbirq type == EV_ABS");
 	} else {
-		input_event(input, type, *bdata->code, state);
+		code = *bdata->code;
+		if(code < KEY_UP || code >KEY_DOWN){
+			input_event(input, type, *bdata->code, state);
+			printk("other_key_report key state = %d\n",state);
+		}
+		else if( code == KEY_UP ){			
+			other_key_report(input,ABS_HAT0Y,state,0);
+		}else if(code == KEY_DOWN){
+			other_key_report(input,ABS_HAT0Y,state,255);
+		}else if(code == KEY_LEFT){
+			other_key_report(input,ABS_HAT0X,state,0);
+		}else if(code == KEY_RIGHT){
+			other_key_report(input,ABS_HAT0X,state,255);
+		}
 	}
 	input_sync(input);
 }
@@ -392,7 +688,7 @@ static irqreturn_t gpio_keys_gpio_isr(int irq, void *dev_id)
 	struct gpio_button_data *bdata = dev_id;
 
 	BUG_ON(irq != bdata->irq);
-
+	DBG("lqbirq func = %s\n,irq = %d\n",__func__,irq);
 	if (bdata->button->wakeup) {
 		const struct gpio_keys_button *button = bdata->button;
 
@@ -420,7 +716,6 @@ static void gpio_keys_irq_timer(struct timer_list *t)
 	struct gpio_button_data *bdata = from_timer(bdata, t, release_timer);
 	struct input_dev *input = bdata->input;
 	unsigned long flags;
-
 	spin_lock_irqsave(&bdata->lock, flags);
 	if (bdata->key_pressed) {
 		input_event(input, EV_KEY, *bdata->code, 0);
@@ -437,9 +732,9 @@ static irqreturn_t gpio_keys_irq_isr(int irq, void *dev_id)
 	unsigned long flags;
 
 	BUG_ON(irq != bdata->irq);
+	DBG("func = %s,lqbjoystick irq = %d\n",__func__,irq);
 
 	spin_lock_irqsave(&bdata->lock, flags);
-
 	if (!bdata->key_pressed) {
 		if (bdata->button->wakeup)
 			pm_wakeup_event(bdata->input->dev.parent, 0);
@@ -467,7 +762,6 @@ out:
 static void gpio_keys_quiesce_key(void *data)
 {
 	struct gpio_button_data *bdata = data;
-
 	if (bdata->gpiod)
 		cancel_delayed_work_sync(&bdata->work);
 	else
@@ -549,6 +843,7 @@ static int gpio_keys_setup_key(struct platform_device *pdev,
 			bdata->irq = button->irq;
 		} else {
 			irq = gpiod_to_irq(bdata->gpiod);
+			
 			if (irq < 0) {
 				error = irq;
 				dev_err(dev,
@@ -765,9 +1060,12 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	struct fwnode_handle *child = NULL;
 	struct gpio_keys_drvdata *ddata;
 	struct input_dev *input;
+	
+	int value;
+	enum iio_chan_type type;
 	int i, error;
 	int wakeup = 0;
-
+	DBG("lqb func = %s\n",__func__);
 	if (!pdata) {
 		pdata = gpio_keys_get_devtree_pdata(dev);
 		if (IS_ERR(pdata))
@@ -780,6 +1078,81 @@ static int gpio_keys_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to allocate state\n");
 		return -ENOMEM;
 	}
+	dev_set_drvdata(&pdev->dev,ddata);
+
+	ddata->last_bra = 0;
+	ddata->last_gas = 0;
+	
+	//joystick x
+	ddata->channelx = devm_iio_channel_get(dev, "joystick_x");
+	if (IS_ERR(ddata->channelx))
+		return PTR_ERR(ddata->channelx);
+
+	if (!ddata->channelx->indio_dev)
+		return -ENXIO;
+
+	error = iio_get_channel_type(ddata->channelx, &type);
+	if (error < 0)
+		return error;
+		
+	if (type != IIO_VOLTAGE) {
+		dev_err(dev, "Incompatible channel type %d\n", type);
+		return -EINVAL;
+	}
+	error = sysfs_create_group(&pdev->dev.kobj,&joystick_calibration_group_attrs);
+	//joystick y
+		ddata->channely = devm_iio_channel_get(dev, "joystick_y");
+		if (IS_ERR(ddata->channely))
+			return PTR_ERR(ddata->channely);
+	
+		if (!ddata->channely->indio_dev)
+			return -ENXIO;
+	
+		error = iio_get_channel_type(ddata->channely, &type);
+		if (error < 0)
+			return error;
+			
+		if (type != IIO_VOLTAGE) {
+			dev_err(dev, "Incompatible channel type %d\n", type);
+			return -EINVAL;
+		}
+	
+		//joystick z
+		ddata->channelz = devm_iio_channel_get(dev, "joystick_z");
+		if (IS_ERR(ddata->channelz))
+			return PTR_ERR(ddata->channelz);
+	
+		if (!ddata->channelz->indio_dev)
+			return -ENXIO;
+		
+		error = iio_get_channel_type(ddata->channelz, &type);
+		if (error < 0)
+			return error;
+			
+		if (type != IIO_VOLTAGE) {
+			dev_err(dev, "Incompatible channel type %d\n", type);
+			return -EINVAL;
+		}
+	
+	
+		//joystick rz
+		ddata->channelrz = devm_iio_channel_get(dev, "joystick_rz");
+		if (IS_ERR(ddata->channelrz))
+			return PTR_ERR(ddata->channelrz);
+	
+		if (!ddata->channelrz->indio_dev)
+			return -ENXIO;
+	
+		error = iio_get_channel_type(ddata->channelrz, &type);
+		if (error < 0)
+			return error;
+			
+		if (type != IIO_VOLTAGE) {
+			dev_err(dev, "Incompatible channel type %d\n", type);
+			return -EINVAL;
+		}
+
+
 
 	ddata->keymap = devm_kcalloc(dev,
 				     pdata->nbuttons, sizeof(ddata->keymap[0]),
@@ -792,7 +1165,16 @@ static int gpio_keys_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to allocate input device\n");
 		return -ENOMEM;
 	}
-
+	error = input_setup_polling(input, adc_joystick_poll);
+	if (error) {
+		dev_err(dev, "Unable to set up polling: %d\n", error);
+		return error;
+	}
+	if (!device_property_read_u32(dev, "poll-interval", &value))
+	{
+		input_set_poll_interval(input, value);
+	}
+	
 	ddata->pdata = pdata;
 	ddata->input = input;
 	mutex_init(&ddata->disable_lock);
@@ -800,20 +1182,56 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, ddata);
 	input_set_drvdata(input, ddata);
 
-	input->name = pdata->name ? : pdev->name;
-	input->phys = "gpio-keys/input0";
+//	input->name = "Microsoft X-Box 360 pad";
+	input->name = "GameForce Controller";
+
 	input->dev.parent = dev;
 	input->open = gpio_keys_open;
 	input->close = gpio_keys_close;
 
 	input->id.bustype = BUS_HOST;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x0001;
-	input->id.version = 0x0100;
+//	input->id.bustype = BUS_USB;
+
+	input->id.vendor = 0x0003;
+	input->id.product = 0x0003;
+
+//	input->id.vendor = 0x045e;
+//	input->id.product = 0x0032;
+//	input->id.product = 0x0b13;
+
+	input->id.version = 0x0110;
 
 	input->keycode = ddata->keymap;
 	input->keycodesize = sizeof(ddata->keymap[0]);
 	input->keycodemax = pdata->nbuttons;
+	
+	__set_bit(EV_ABS, input->evbit);
+	__set_bit(ABS_BRAKE, input->absbit); 
+	__set_bit(ABS_THROTTLE, input->absbit);
+	__set_bit(ABS_HAT0Y, input->absbit);
+	__set_bit(ABS_HAT0X, input->absbit);
+	__set_bit(ABS_X, input->absbit);
+	__set_bit(ABS_Y, input->absbit);
+//	__set_bit(ABS_RX, input->absbit);
+//	__set_bit(ABS_RY, input->absbit);
+	__set_bit(ABS_RZ, input->absbit);
+	__set_bit(ABS_Z, input->absbit);
+
+	__set_bit(BTN_TL2, input->keybit);
+	__set_bit(BTN_TR2, input->keybit);
+	
+	input_set_abs_params(input, ABS_X, 0, 255, 0, 15);
+//	input_set_abs_params(input, ABS_RX, 0, 255, 0, 15);
+//	input_set_abs_params(input, ABS_RY, 0, 255, 0, 15);
+	input_set_abs_params(input, ABS_Y, 0, 255, 0, 15);
+	input_set_abs_params(input, ABS_Z, 0, 255, 0, 15);
+	input_set_abs_params(input, ABS_RZ, 0, 255, 0, 15);
+	input_set_abs_params(input, ABS_BRAKE, 0, 255, 0, 15);
+	input_set_abs_params(input, ABS_THROTTLE, 0, 255, 0, 15);
+	//0xff :  up  , 0x01 : down
+	input_set_abs_params(input, ABS_HAT0Y, 0, 255, 0, 0);
+	//0xff : left , 0x01 : right
+	input_set_abs_params(input, ABS_HAT0X, 0, 255, 0, 0);
 
 	/* Enable auto repeat feature of Linux input subsystem */
 	if (pdata->rep)

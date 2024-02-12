@@ -208,7 +208,7 @@ static void hdp_disable(struct hdmi_connector *hdmi_connector)
 	const struct hdmi_platform_config *config = hdmi->config;
 	struct device *dev = &hdmi->pdev->dev;
 	int i, ret = 0;
-
+	printk("gsy hdp_disable");
 	/* Disable HPD interrupt */
 	hdmi_write(hdmi, REG_HDMI_HPD_INT_CTRL, 0);
 
@@ -240,6 +240,7 @@ msm_hdmi_hotplug_work(struct work_struct *work)
 		container_of(work, struct hdmi_connector, hpd_work);
 	struct drm_connector *connector = &hdmi_connector->base;
 	drm_helper_hpd_irq_event(connector->dev);
+	printk("gsy drm_helper_hpd_irq_event\n");
 }
 
 void msm_hdmi_connector_irq(struct drm_connector *connector)
